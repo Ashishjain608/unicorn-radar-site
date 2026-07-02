@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UNICORN·RADAR — funded AI companies, scanned for hiring signals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unica+One&family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+<div class="scanline" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="wordmark">UNICORN<span class="tick">·</span>RADAR</div>
+  <div class="topbar-meta">
+    <span class="pulse-dot" aria-hidden="true"></span>
+    <span id="snapshot-stamp">SNAPSHOT —</span>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="hero-kicker">// AI COMPANY RADAR</p>
+    <h1 class="hero-title">Recently funded AI companies,<br>scanned for <em>applied-AI hiring signals</em></h1>
+    <p class="hero-sub">Forbes AI 50 · CB Insights AI 100 · Y Combinator 2023–26 — enriched with live
+    job-board probes (Greenhouse / Lever / Ashby) for open AI roles &amp; India offices.</p>
+
+    <div class="stats" id="stats">
+      <div class="stat" style="--i:0"><div class="stat-num" data-stat="total">0</div><div class="stat-label">companies tracked</div></div>
+      <div class="stat" style="--i:1"><div class="stat-num accent" data-stat="hiring_ai">0</div><div class="stat-label">hiring AI roles now</div></div>
+      <div class="stat" style="--i:2"><div class="stat-num amber" data-stat="india">0</div><div class="stat-label">with India presence</div></div>
+      <div class="stat" style="--i:3"><div class="stat-num" data-stat="funding">$0</div><div class="stat-label">disclosed funding</div></div>
+    </div>
+  </section>
+
+  <section class="deck" aria-label="filters">
+    <div class="deck-row">
+      <div class="search-wrap">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input id="search" type="search" placeholder="search company, category, role…" autocomplete="off">
+      </div>
+      <select id="sort" aria-label="sort">
+        <option value="ai_roles">sort: AI roles open</option>
+        <option value="funding">sort: funding</option>
+        <option value="open_roles">sort: total open roles</option>
+        <option value="name">sort: name A–Z</option>
+      </select>
+    </div>
+    <div class="deck-row chips" id="chips">
+      <div class="chip-group" data-group="toggle">
+        <button class="chip hot" data-key="hiring">⚡ hiring AI roles</button>
+        <button class="chip amberchip" data-key="india">🇮🇳 India office</button>
+      </div>
+      <span class="chip-sep"></span>
+      <div class="chip-group" data-group="bracket">
+        <button class="chip" data-key="$200M+">$200M+</button>
+        <button class="chip" data-key="$50-200M">$50–200M</button>
+        <button class="chip" data-key="$10-50M">$10–50M</button>
+        <button class="chip" data-key="<$10M">&lt;$10M</button>
+        <button class="chip" data-key="unknown">undisclosed</button>
+      </div>
+      <span class="chip-sep"></span>
+      <div class="chip-group" data-group="tag">
+        <button class="chip coral" data-key="frontier">frontier</button>
+        <button class="chip" data-key="ai-native">ai-native</button>
+      </div>
+      <span class="chip-sep"></span>
+      <div class="chip-group" data-group="source">
+        <button class="chip" data-key="forbes">Forbes 50</button>
+        <button class="chip" data-key="cbinsights">CBI 100</button>
+        <button class="chip" data-key="yc">YC</button>
+      </div>
+      <button class="chip clear" id="clear-filters" hidden>✕ clear</button>
+    </div>
+  </section>
+
+  <section class="results">
+    <div class="results-head">
+      <span id="result-count">— targets</span>
+      <span class="results-hint">click a row for details &amp; job links</span>
+    </div>
+    <ol id="list" class="list"></ol>
+    <button id="more" class="more" hidden>load more ↓</button>
+  </section>
+</main>
+
+<footer>
+  <p>snapshot 2026-07-02 · Forbes AI 50 2026 · CB Insights AI 100 2026 · YC directory ·
+  live ATS job-board probes (Greenhouse / Lever / Ashby) — full pipeline documented in WORKFLOW.md.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
