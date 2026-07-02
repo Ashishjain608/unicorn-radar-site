@@ -37,6 +37,7 @@ function filtered() {
   let rows = DATA.filter((c) => {
     if (state.toggle.has("hiring") && !(c.ai_roles > 0)) return false;
     if (state.toggle.has("india") && !c.india_office) return false;
+    if (state.toggle.has("fresh") && !(c.last_funding_year >= 2025)) return false;
     if (state.bracket.size && !state.bracket.has(c.bracket)) return false;
     if (state.tag.size && !state.tag.has(c.tag)) return false;
     if (state.source.size && ![...state.source].some((s) => (c.source || "").includes(s))) return false;
@@ -72,7 +73,7 @@ function rowHTML(c, i) {
     </div>
     <div class="row-detail">
       <div class="desc">${esc(c.desc) || "—"}</div>
-      <div class="meta-line">${esc(c.hq || "HQ unknown")} · raised ${funding} · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}</div>
+      <div class="meta-line">${esc(c.hq || "HQ unknown")} · raised ${funding}${c.last_funding_year ? ` · last round ${c.last_funding_year}` : ""} · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}</div>
       ${c.ai_role_titles ? `<div class="roles">▸ ${esc(c.ai_role_titles)}</div>` : ""}
       <div class="actions">
         ${c.jobs_url ? `<a class="btn" href="${esc(c.jobs_url)}" target="_blank" rel="noopener">VIEW ${c.open_roles} OPEN ROLES ↗</a>` : ""}
