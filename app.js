@@ -1,6 +1,6 @@
 /* UNICORN·RADAR — fetch JSON, filter, render. No deps. */
 const PAGE = 120;
-const state = { q: "", sort: "ai_roles", toggle: new Set(), bracket: new Set(), tag: new Set(), source: new Set(), shown: PAGE };
+const state = { q: "", sort: "relevance", toggle: new Set(), bracket: new Set(), tag: new Set(), source: new Set(), shown: PAGE };
 let DATA = [], MAXAI = 1;
 
 const $ = (s) => document.querySelector(s);
@@ -48,14 +48,37 @@ function filtered() {
   rows.sort(
     key === "name" ? (a, b) => a.name.localeCompare(b.name)
     : key === "funding" ? (a, b) => (b.funding_musd || 0) - (a.funding_musd || 0)
+    : key === "recency" ? (a, b) => (b.last_funding_year || 0) - (a.last_funding_year || 0) || (b.ai_roles || 0) - (a.ai_roles || 0)
+    : key === "relevance" ? (a, b) => score(b) - score(a)
     : (a, b) => (b[key] || 0) - (a[key] || 0) || (b.funding_musd || 0) - (a.funding_musd || 0)
   );
   return rows;
 }
 
+// relevance for an applied-AI engineer scouting opportunities:
+// live AI hiring dominates, then funding freshness (runway/growth), India, size
+function score(c) {
+  return Math.sqrt(c.ai_roles || 0) * 4
+    + (c.last_funding_year >= 2026 ? 3 : c.last_funding_year === 2025 ? 2 : c.last_funding_year === 2024 ? 1 : 0)
+    + (c.india_office ? 1.5 : 0)
+    + (c.is_hiring ? 1 : 0)
+    + Math.min(Math.log10((c.funding_musd || 0) + 1), 3);
+}
+
 function srcLabel(s) {
   return s.replace("forbes-ai50-2026", "FORBES50").replace("cbinsights-ai100-2026", "CBI100")
-    .replace(/yc-(\w+) (\d{4})/, (_, sea, y) => `YC ${sea[0]}${y.slice(2)}`).replace("+yc", "+YC");
+    .replace(/yc-(\w+) (\d{4})/, (_, sea, y) => `YC ${sea[0]}${y.slice(2)}`).replace("+yc", "+YC")
+    .replace("finsmes", "NEWS").replace("techcrunch", "TC").replace("startuptalky", "IN-NEWS")
+    .replace("topstartups", "PORTFOLIO").replace("unicorns", "UNICORN").replace("formd", "SEC")
+    .replace(/\+news$/, "");
+}
+
+function roundLabel(c) {
+  const bits = [];
+  if (c.funding_musd) bits.push(fmtM(c.funding_musd));
+  if (c.last_round) bits.push(c.last_round);
+  if (c.last_funding_date) bits.push(c.last_funding_date);
+  return bits.join(" · ");
 }
 
 function rowHTML(c, i) {
@@ -65,7 +88,7 @@ function rowHTML(c, i) {
     <div class="row-main" role="button" tabindex="0" aria-expanded="false">
       <span class="rank">${i + 1}</span>
       <span class="cname"><b>${esc(c.name)}</b>${c.india_office ? '<span class="badge-in">IN</span>' : ""}</span>
-      <span class="tag ${c.tag}">${c.tag === "frontier" ? "◆ frontier" : "· ai-native"}</span>
+      <span class="tag ${c.tag}">${c.tag === "frontier" ? "◆ frontier" : c.tag === "ai-adopter" ? "○ ai-adopter" : "· ai-native"}</span>
       <span class="bracket b-${c.bracket === "unknown" ? "unknown" : "known"}">${c.bracket === "unknown" ? "—" : c.bracket}</span>
       <span class="signal"><span class="signal-bar"><span class="signal-fill" style="width:${pct}%"></span></span>
         <span class="signal-n ${c.ai_roles ? "" : "zero"}">${c.ai_roles ? c.ai_roles + " AI" : c.ats ? "0 AI" : "no ATS"}</span></span>
@@ -73,12 +96,16 @@ function rowHTML(c, i) {
     </div>
     <div class="row-detail">
       <div class="desc">${esc(c.desc) || "—"}</div>
-      <div class="meta-line">${esc(c.hq || "HQ unknown")} · raised ${funding}${c.last_funding_year ? ` · last round ${c.last_funding_year}` : ""} · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}</div>
+      <div class="meta-line">${esc(c.hq || "HQ unknown")}
+        · ${roundLabel(c) ? `last known round: ${esc(roundLabel(c))}` : "funding undisclosed"}
+        · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}${c.india_entity ? " · 🇮🇳 MCA-registered India entity" : ""}</div>
+      ${c.investors ? `<div class="meta-line">backed by ${esc(c.investors)}</div>` : ""}
       ${c.ai_role_titles ? `<div class="roles">▸ ${esc(c.ai_role_titles)}</div>` : ""}
       <div class="actions">
         ${c.jobs_url ? `<a class="btn" href="${esc(c.jobs_url)}" target="_blank" rel="noopener">VIEW ${c.open_roles} OPEN ROLES ↗</a>` : ""}
         ${c.website ? `<a class="btn ghost" href="${esc(c.website)}" target="_blank" rel="noopener">WEBSITE ↗</a>` : ""}
-        <a class="btn ghost" href="https://www.google.com/search?q=${encodeURIComponent(c.name + " funding")}" target="_blank" rel="noopener">SEARCH FUNDING ↗</a>
+        ${c.news_url ? `<a class="btn ghost" href="${esc(c.news_url)}" target="_blank" rel="noopener">FUNDING NEWS ↗</a>` : ""}
+        <a class="btn ghost" href="https://www.google.com/search?q=${encodeURIComponent(c.name + " funding")}" target="_blank" rel="noopener">SEARCH ↗</a>
       </div>
     </div>
   </li>`;

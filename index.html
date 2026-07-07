@@ -43,8 +43,10 @@
         <input id="search" type="search" placeholder="search company, category, role…" autocomplete="off">
       </div>
       <select id="sort" aria-label="sort">
+        <option value="relevance">sort: relevance for AI folks</option>
         <option value="ai_roles">sort: AI roles open</option>
         <option value="funding">sort: funding</option>
+        <option value="recency">sort: freshest funding</option>
         <option value="open_roles">sort: total open roles</option>
         <option value="name">sort: name A–Z</option>
       </select>
@@ -67,6 +69,7 @@
       <div class="chip-group" data-group="tag">
         <button class="chip coral" data-key="frontier">frontier</button>
         <button class="chip" data-key="ai-native">ai-native</button>
+        <button class="chip" data-key="ai-adopter">ai-adopter</button>
       </div>
       <span class="chip-sep"></span>
       <div class="chip-group" data-group="source">
