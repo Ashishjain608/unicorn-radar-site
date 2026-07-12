@@ -9,8 +9,8 @@ const fmtM = (m) => m >= 1000 ? `$${(m / 1000).toFixed(m >= 10000 ? 0 : 1)}B` : 
 
 async function boot() {
   const [companies, meta] = await Promise.all([
-    fetch("data/companies.json").then((r) => r.json()),
-    fetch("data/meta.json").then((r) => r.json()),
+    fetch("data/companies.json", { cache: "no-cache" }).then((r) => r.json()),
+    fetch("data/meta.json", { cache: "no-cache" }).then((r) => r.json()),
   ]);
   DATA = companies;
   MAXAI = Math.max(...DATA.map((c) => c.ai_roles || 0), 1);
