@@ -38,6 +38,7 @@ function filtered() {
     if (state.toggle.has("hiring") && !(c.ai_roles > 0)) return false;
     if (state.toggle.has("india") && !c.india_office) return false;
     if (state.toggle.has("fresh") && !(c.last_funding_year >= 2025)) return false;
+    if (state.toggle.has("salary") && !c.salary_text) return false;
     if (state.bracket.size && !state.bracket.has(c.bracket)) return false;
     if (state.tag.size && !state.tag.has(c.tag)) return false;
     if (state.source.size && ![...state.source].some((s) => (c.source || "").includes(s))) return false;
@@ -99,6 +100,7 @@ function rowHTML(c, i) {
       <div class="meta-line">${esc(c.hq || "HQ unknown")}
         · ${roundLabel(c) ? `last known round: ${esc(roundLabel(c))}` : "funding undisclosed"}
         · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}${c.india_entity ? " · 🇮🇳 MCA-registered India entity" : ""}${c.india_ai_roles > 0 ? ` · 🇮🇳 ${c.india_ai_roles} AI roles in India` : ""}</div>
+      ${c.salary_text ? `<div class="meta-line">💰 <a href="${esc(c.salary_url)}" target="_blank" rel="noopener">${esc(c.salary_text)} · ${esc((c.salary_date || "").slice(0, 7))} (${esc(c.salary_source)}) ↗</a></div>` : ""}
       ${c.investors ? `<div class="meta-line">backed by ${esc(c.investors)}</div>` : ""}
       ${c.ai_role_titles ? `<div class="roles">▸ ${esc(c.ai_role_titles)}</div>` : ""}
       <div class="actions">
