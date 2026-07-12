@@ -98,7 +98,7 @@ function rowHTML(c, i) {
       <div class="desc">${esc(c.desc) || "—"}</div>
       <div class="meta-line">${esc(c.hq || "HQ unknown")}
         · ${roundLabel(c) ? `last known round: ${esc(roundLabel(c))}` : "funding undisclosed"}
-        · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}${c.india_entity ? " · 🇮🇳 MCA-registered India entity" : ""}</div>
+        · ${c.open_roles || 0} open roles${c.is_hiring ? " · YC: actively hiring" : ""}${c.india_entity ? " · 🇮🇳 MCA-registered India entity" : ""}${c.india_ai_roles > 0 ? ` · 🇮🇳 ${c.india_ai_roles} AI roles in India` : ""}</div>
       ${c.investors ? `<div class="meta-line">backed by ${esc(c.investors)}</div>` : ""}
       ${c.ai_role_titles ? `<div class="roles">▸ ${esc(c.ai_role_titles)}</div>` : ""}
       <div class="actions">
