@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UNICORN·RADAR — live tech jobs at AI companies, ranked for you</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unica+One&family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css?v=c900c6c">
+<link rel="alternate" type="application/atom+xml" title="New AI engineering jobs" href="feeds/ai-applied.xml">
+<!-- Google Analytics (GA4) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-VEELEGZECG"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-VEELEGZECG');
+</script>
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+<div class="scanline" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="wordmark">UNICORN<span class="tick">·</span>RADAR</div>
+  <div class="topbar-meta">
+    <span class="pulse-dot" aria-hidden="true"></span>
+    <span id="snapshot-stamp">SNAPSHOT —</span>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="hero-kicker">// AI JOB RADAR</p>
+    <h1 class="hero-title">Every tech opening at AI companies,<br><em>ranked for your profile</em></h1>
+    <p class="hero-sub">Read daily from employers' own job boards (Greenhouse, Lever, Ashby, Workday and 9 more) plus
+    Hacker News "Who is hiring". Tell it your roles, level, location and pay floor; it keeps your profile in this browser.</p>
+
+    <div class="stats" id="stats">
+      <div class="stat" style="--i:0"><div class="stat-num accent" data-stat="jobs">0</div><div class="stat-label">open tech jobs</div></div>
+      <div class="stat" style="--i:1"><div class="stat-num amber" data-stat="jobs_new_7d">0</div><div class="stat-label">new this week</div></div>
+      <div class="stat" style="--i:2"><div class="stat-num" data-stat="total">0</div><div class="stat-label">AI companies tracked</div></div>
+      <div class="stat" style="--i:3"><div class="stat-num" data-stat="hiring_ai">0</div><div class="stat-label">hiring AI roles now</div></div>
+    </div>
+  </section>
+
+  <nav class="tabs" role="tablist" aria-label="views">
+    <a href="#jobs" class="tab" role="tab" data-view="jobs">JOBS</a>
+    <a href="#companies" class="tab" role="tab" data-view="companies">COMPANIES</a>
+    <a href="#signals" class="tab" role="tab" data-view="signals">SIGNALS</a>
+    <a href="#skills" class="tab" role="tab" data-view="skills">SKILLS</a>
+  </nav>
+
+  <!-- ── JOBS ─────────────────────────────────────────────────────────── -->
+  <section class="view" id="view-jobs" hidden>
+    <details class="deck profile" id="profile" open>
+      <summary><span>YOUR PROFILE</span><span class="profile-sum" id="profile-sum"></span></summary>
+      <div class="pf-grid">
+        <div class="pf-field pf-wide">
+          <label>Roles</label>
+          <div class="chip-group" id="pf-families"></div>
+        </div>
+        <div class="pf-field">
+          <label for="pf-level">Level</label>
+          <select id="pf-level">
+            <option value="0">any level</option>
+            <option value="2">mid and up</option>
+            <option value="3">senior and up</option>
+            <option value="4">staff and up</option>
+            <option value="5">principal / director and up</option>
+          </select>
+        </div>
+        <div class="pf-field">
+          <label for="pf-home">I live in</label>
+          <select id="pf-home"></select>
+        </div>
+        <div class="pf-field">
+          <label for="pf-where">Open to</label>
+          <select id="pf-where">
+            <option value="home">jobs in my country + remote</option>
+            <option value="relocate">relocating abroad (needs sponsorship)</option>
+            <option value="remote">remote only</option>
+            <option value="anywhere">anywhere, no filter</option>
+          </select>
+        </div>
+        <div class="pf-field">
+          <label for="pf-pay">Pay floor (USD / yr, when posted)</label>
+          <select id="pf-pay">
+            <option value="0">no floor</option>
+            <option value="100000">$100k+</option>
+            <option value="150000">$150k+</option>
+            <option value="200000">$200k+</option>
+            <option value="250000">$250k+</option>
+            <option value="300000">$300k+</option>
+          </select>
+        </div>
+        <div class="pf-field">
+          <label for="pf-tier">Employer pay tier</label>
+          <select id="pf-tier">
+            <option value="">any employer</option>
+            <option value="mid">pays $150k+ (posted bands)</option>
+            <option value="high">pays $220k+</option>
+            <option value="top">pays $300k+</option>
+          </select>
+        </div>
+        <div class="pf-field pf-wide">
+          <label for="pf-skills">Skills &amp; keywords (boost)</label>
+          <input id="pf-skills" type="text" placeholder="e.g. pytorch, vllm, video, agents, kubernetes" autocomplete="off">
+        </div>
+        <div class="pf-field pf-wide pf-checks">
+          <label class="check"><input type="checkbox" id="pf-noghost"> hide postings older than 6 months</label>
+          <label class="check"><input type="checkbox" id="pf-aionly"> only AI companies in the dataset</label>
+          <button class="btn ghost" id="pf-share" type="button">COPY PROFILE LINK</button>
+        </div>
+      </div>
+    </details>
+
+    <div class="deck-row jobs-bar">
+      <div class="search-wrap">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input id="job-search" type="search" placeholder="search title, company, location…" autocomplete="off">
+      </div>
+      <select id="job-sort" aria-label="sort jobs">
+        <option value="match">sort: best match</option>
+        <option value="new">sort: newest</option>
+        <option value="pay">sort: highest pay</option>
+      </select>
+      <button class="chip hot" id="new-only" type="button">● new since last visit</button>
+    </div>
+
+    <div class="results">
+      <div class="results-head">
+        <span id="job-count">— jobs</span>
+        <span class="results-hint" id="job-hint"></span>
+      </div>
+      <ol id="job-list" class="list jobs"></ol>
+      <button id="job-more" class="more" hidden>load more ↓</button>
+      <p class="feeds" id="feeds"></p>
+    </div>
+  </section>
+
+  <!-- ── COMPANIES ─────────────────────────────────────────────────────── -->
+  <section class="view" id="view-companies" hidden>
+    <div class="deck">
+      <div class="deck-row">
+        <div class="search-wrap">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="search" type="search" placeholder="search company, category, role…" autocomplete="off">
+        </div>
+        <select id="sort" aria-label="sort">
+          <option value="relevance">sort: relevance for AI folks</option>
+          <option value="ai_roles">sort: AI roles open</option>
+          <option value="pay_top">sort: posted pay (top of band)</option>
+          <option value="tech_delta_7d">sort: hiring momentum (7 days)</option>
+          <option value="funding">sort: funding</option>
+          <option value="recency">sort: freshest funding</option>
+          <option value="open_roles">sort: total open roles</option>
+          <option value="name">sort: name A–Z</option>
+        </select>
+      </div>
+      <div class="deck-row chips" id="chips">
+        <div class="chip-group" data-group="toggle">
+          <button class="chip hot" data-key="hiring">⚡ hiring AI roles</button>
+          <button class="chip amberchip" data-key="india">🇮🇳 India office</button>
+          <button class="chip" data-key="fresh">💰 funded 2025–26</button>
+          <button class="chip" data-key="paytop">💵 pays $220k+</button>
+        </div>
+        <span class="chip-sep"></span>
+        <div class="chip-group" data-group="bracket">
+          <button class="chip" data-key="$200M+">$200M+</button>
+          <button class="chip" data-key="$50-200M">$50–200M</button>
+          <button class="chip" data-key="$10-50M">$10–50M</button>
+          <button class="chip" data-key="<$10M">&lt;$10M</button>
+          <button class="chip" data-key="unknown">undisclosed</button>
+        </div>
+        <span class="chip-sep"></span>
+        <div class="chip-group" data-group="tag">
+          <button class="chip coral" data-key="frontier">frontier</button>
+          <button class="chip" data-key="ai-native">ai-native</button>
+          <button class="chip" data-key="ai-adopter">ai-adopter</button>
+        </div>
+        <span class="chip-sep"></span>
+        <div class="chip-group" data-group="source">
+          <button class="chip" data-key="forbes">Forbes 50</button>
+          <button class="chip" data-key="cbinsights">CBI 100</button>
+          <button class="chip" data-key="yc">YC</button>
+          <button class="chip" data-key="board">hiring board</button>
+        </div>
+        <button class="chip clear" id="clear-filters" hidden>✕ clear</button>
+      </div>
+    </div>
+
+    <div class="results">
+      <div class="results-head">
+        <span id="result-count">— targets</span>
+        <span class="results-hint">click a row for details &amp; job links</span>
+      </div>
+      <ol id="list" class="list"></ol>
+      <button id="more" class="more" hidden>load more ↓</button>
+    </div>
+  </section>
+
+  <!-- ── SIGNALS ───────────────────────────────────────────────────────── -->
+  <section class="view" id="view-signals" hidden>
+    <p class="view-intro">Things only a daily history can show: a company's first job in a new country (usually a new
+    office, with founding roles), its first Staff/Principal opening, a jump in technical openings, and new Indian
+    subsidiaries registered before any Indian job appears.</p>
+    <div class="deck-row chips" id="sig-chips">
+      <div class="chip-group">
+        <button class="chip on" data-type="">all</button>
+        <button class="chip" data-type="new-country">new country</button>
+        <button class="chip" data-type="first-staff">first Staff+ role</button>
+        <button class="chip" data-type="build-out">team build-out</button>
+        <button class="chip" data-type="new-india-entity">new India entity</button>
+      </div>
+    </div>
+    <ol id="sig-list" class="list signals"></ol>
+  </section>
+
+  <!-- ── SKILLS ────────────────────────────────────────────────────────── -->
+  <section class="view" id="view-skills" hidden>
+    <p class="view-intro">Share of open technical postings (with a readable description) that mention each skill.
+    The last column is employers whose posted pay bands reach $220k+: what well-paying teams ask for.</p>
+    <div class="skills-wrap"><table class="skills" id="skills-table"></table></div>
+  </section>
+</main>
+
+<footer>
+  <p><span id="foot-sources">Sources: employer job boards read daily; funding from FinSMEs, SEC Form D, TechCrunch,
+  StartupTalky, topstartups.io, CB Insights; India entities from the MCA register.</span>
+  Pay tiers come from bands employers post themselves. Your profile never leaves this browser.</p>
+</footer>
+
+<script src="app.js?v=c900c6c"></script>
+</body>
+</html>

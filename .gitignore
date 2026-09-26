@@ -1,0 +1,3 @@
+pipeline/cache/*
+!pipeline/cache/mca_subs.json
+pipeline/__pycache__/
