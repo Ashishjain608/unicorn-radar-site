@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+"""jobs: scan every known job board, keep a posting-level ledger, publish the job feed.
+
+Replaces boards.py. The unit is the *posting*, not the company: each technical posting
+is tracked with first_seen / last_seen, so the site can say "new since your last visit",
+close postings the day the employer does, and derive things only history can show
+(time-to-close, reposts, first job in a new country).
+
+Multi-user by construction: everything computed here is user-independent (features.py).
+Each visitor's profile ranks the published postings in the browser.
+
+State (cache/ledger.json.gz, cache/history.json) is the only thing a run needs from the
+last one. Throttled boards carry their postings forward untouched — a rate-limited
+fetch must never read as "every job here closed".
+
+Usage: python3 jobs.py [--workers 12] [--only greenhouse,lever] [--limit N] [--no-refresh]
+Outputs: cache/ledger.json.gz, cache/history.json, cache/boards.json (unicorn_radar.py input),
+         web/data/jobs.json, web/data/skills.json, web/data/events.json, web/feeds/*.xml
+"""
+import argparse, csv, datetime, gzip, html, json, os, re, statistics, threading, time
+import urllib.parse, urllib.request, xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import features as F
+import unicorn_radar as u
+from unicorn_radar import HERE, Throttled, get_json, get_bytes, norm
+
+TODAY = datetime.date.today().isoformat()
+LEDGER, HISTORY = HERE / "cache" / "ledger.json.gz", HERE / "cache" / "history.json"
+EXTRA_BOARDS = HERE / "cache" / "extra_boards.csv"  # discover_boards.py output
+WEB = HERE / "web"
+PLATFORMS = ("greenhouse", "lever", "ashby", "workable", "smartrecruiters", "workday", "bamboohr",
+             "rippling", "personio", "teamtailor", "breezy", "recruitee",
+             "oracle", "pinpoint", "icims", "eightfold", "comeet",  # these and below: fetchers_extra.py
+             "trakstar", "freshteam", "gem", "kula", "darwinbox", "sfrmk", "jibe", "atlassian", "nutanix",
+             "amazon", "microsoft", "avature", "phenom", "keka", "zoho")
+CLOSED_KEEP_DAYS = 45       # closed postings are kept this long for repost + time-to-close
+FACTS_V = 2                 # bump when a description rule in features.py changes; see Scan.known
+DETAIL_CAP = 8000           # per-run cap on per-posting detail fetches (Workday/SmartRecruiters)
+JSONH = {"Content-Type": "application/json", "Accept": "application/json"}
+NEW_BOARD_DAYS = 30       # an employer whose every technical posting is this recent may be new...
+WAYBACK_NEW_DAYS = 90     # ...if Wayback has no capture of its board (any page under it) older than this
+WAYBACK_CAP, WAYBACK_SECONDS = 300, 600  # first-capture lookups per run, and their wall-clock budget
+# Startup ATS boards and the scheme-less URL Wayback is asked about. Enterprise ATS (Workday, Oracle,
+# iCIMS, Eightfold, SmartRecruiters, SuccessFactors, own-site Amazon/Microsoft/...) are absent on
+# purpose: a fresh board there is an old firm's new site, never a new company.
+BOARD_URL = {"greenhouse": "job-boards.greenhouse.io/{}", "lever": "jobs.lever.co/{}", "ashby": "jobs.ashbyhq.com/{}",
+             "workable": "apply.workable.com/{}", "bamboohr": "{}.bamboohr.com", "rippling": "ats.rippling.com/{}",
+             "personio": "{}.jobs.personio.com", "teamtailor": "{}.teamtailor.com", "breezy": "{}.breezy.hr",
+             "recruitee": "{}.recruitee.com", "pinpoint": "{}.pinpointhq.com", "comeet": "www.comeet.com/jobs/{}",
+             "trakstar": "{}.hire.trakstar.com", "freshteam": "{}.freshteam.com", "gem": "jobs.gem.com/{}",
+             "kula": "careers.kula.ai/{}", "darwinbox": "{}.darwinbox.in"}
+WORKER_SCALE = {"workday": 2, "workable": 0.34, "eightfold": 0}  # multiples of --workers (see scan_all)
+
+
+def day(v):
+    """ISO timestamp / epoch-ms / date string -> 'YYYY-MM-DD' (or None)."""
+    if not v:
+        return None
+    if isinstance(v, (int, float)):
+        return datetime.datetime.fromtimestamp(v / 1000, datetime.timezone.utc).date().isoformat()
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", str(v))
+    return m.group(1) if m and m.group(1) <= TODAY else None
+
+
+def text(v):
+    return html.unescape(re.sub(r"<[^>]+>", " ", v or ""))
+
+
+def J(id, title, loc="", url=None, posted=None, remote=None, desc=None, comp=None, co=None):
+    return {"id": str(id), "title": (title or "").strip(), "loc": loc or "", "url": url, "posted": posted,
+            "remote": remote, "desc": desc, "comp": comp, "co": co}
+
+
+# ── board lists ──────────────────────────────────────────────────────────────
+def refresh_lists(max_age_days=7):
+    """Upstream ats-scrapers lists grow ~19%/quarter; a stale copy silently caps coverage."""
+    for p in PLATFORMS:
+        f = HERE / "cache" / f"ats_{p}.csv"
+        if f.exists() and time.time() - f.stat().st_mtime < max_age_days * 86400:
+            continue
+        try:
+            raw = get_bytes(u.ATS_DUMP.format(p), timeout=60)
+            if raw:  # a 404 (comeet has no upstream list) must not blank a cached copy
+                f.write_bytes(raw)
+        except Throttled as e:
+            print(f"  ! board list {p}: {e} — using cached copy")
+
+
+HARVEST = HERE / "cache" / "harvest_boards.csv"  # accumulates across CI runs via state/
+HARVEST_JSON = ("https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+                "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json")
+HARVEST_ASHBY = "https://raw.githubusercontent.com/AnshumanAtrey/ashby-jobs-search/main/src/companies.tsv"
+NOT_SLUG = {"embed", "v1", "api", "jobs", "job_app", "job_board"}
+
+
+def _board_links(s, name):
+    for m in u.ATS_LINK.finditer(s or ""):
+        if name and m.group(1).lower() not in NOT_SLUG and s[m.end():m.end() + 1] != ".":  # "a.b" slug: not matched whole
+            plat = next(p for p in u.SNIFF_PLATFORMS if p in m.group(0))
+            yield {"platform": plat, "slug": m.group(1), "name": name.strip()[:80], "url": ""}
+
+
+def _harvest_simplify():
+    for url in HARVEST_JSON:
+        for x in get_json(url, timeout=90) or []:
+            if x.get("active"):
+                yield from _board_links(x.get("url"), x.get("company_name"))
+
+
+def _harvest_ashby_list():
+    for ln in (get_bytes(HARVEST_ASHBY, timeout=60) or b"").decode(errors="replace").splitlines():
+        if "\t" in ln and not ln.startswith("#"):
+            slug, name = ln.split("\t", 1)
+            yield {"platform": "ashby", "slug": slug.strip(), "name": name.strip(), "url": ""}
+
+
+def _harvest_hn():
+    for j in f_hn(None) or []:
+        yield from _board_links(j["desc"], j["co"])
+
+
+# ---- crawl + company-first sources (bead wv0). Every candidate is live-verified before it is yielded.
+HARVEST_CHRIS = "https://raw.githubusercontent.com/chrishires/ashby-bot/main/boards.txt"
+YC_ALL = "https://yc-oss.github.io/api/companies/all.json"  # CI has no yc_cache.json (gitignored)
+VERIFY_CAP = 800  # ponytail: max live verifications per crawl source (CI time bound); raise if a source saturates
+GUESS_CAP = 4000  # ponytail: max slug-probe API calls per guess source; no miss cache (CI keeps only harvest_boards.csv), add one in state/ if daily re-probing hurts
+WAYBACK_DAYS = 60
+
+
+def _known_slugs():
+    seen = set()
+    for f in [*(HERE / "cache").glob("ats_*.csv"), EXTRA_BOARDS, HARVEST]:
+        if f.exists():
+            seen |= {((r.get("platform") or f.stem.removeprefix("ats_")), (r.get("slug") or "").lower())
+                     for r in csv.DictReader(open(f, errors="replace"))}
+    return seen
+
+
+def _ashby_org_name(slug):
+    q = {"operationName": "ApiOrganizationFromHostedJobsPageName",
+         "variables": {"organizationHostedJobsPageName": slug, "searchContext": "JobBoard"},
+         "query": "query ApiOrganizationFromHostedJobsPageName($organizationHostedJobsPageName: String!, "
+                  "$searchContext: OrganizationSearchContext) { organization: organizationFromHostedJobsPageName("
+                  "organizationHostedJobsPageName: $organizationHostedJobsPageName, searchContext: $searchContext) { name } }"}
+    try:
+        req = urllib.request.Request("https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiOrganizationFromHostedJobsPageName",
+                                     json.dumps(q).encode(), {"content-type": "application/json", "user-agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return ((json.load(r).get("data") or {}).get("organization") or {}).get("name") or ""
+    except Exception:
+        return ""
+
+
+def _live(plat, slug):
+    """-> row dict if the board has >=1 job, else None. Name: platform's own, Ashby via GraphQL, else title-cased slug."""
+    import discover_boards as d  # lazy: pulls discover.py (certifi)
+    try:
+        v = d.VERIFY[plat](slug)
+    except Exception:
+        return None
+    if not v:
+        return None
+    name = (_ashby_org_name(slug) if plat == "ashby" else "") or v[0]
+    return {"platform": plat, "slug": slug, "name": name[:80], "url": v[1]}
+
+
+def _verified(cands, cap=VERIFY_CAP):
+    """cands: iterable of (platform, slug). Drops known boards, verifies up to `cap` with 16 threads."""
+    import discover_boards as d
+    known = _known_slugs()
+    todo = list(dict.fromkeys((p, s.lower()) for p, s in cands if (p, s.lower()) not in known and d.SLUG_RE.match(s.lower())))[:cap]
+    with ThreadPoolExecutor(16) as ex:
+        yield from (r for r in ex.map(lambda c: _live(*c), todo) if r)
+
+
+def _harvest_chris():
+    lines = (get_bytes(HARVEST_CHRIS, timeout=60) or b"").decode(errors="replace").splitlines()[1:]  # line 1 is a header
+    yield from _verified(("ashby", x.strip()) for x in lines if x.strip())
+
+
+def _harvest_wayback():
+    import discover_boards as d
+    start = (datetime.date.today() - datetime.timedelta(days=WAYBACK_DAYS)).strftime("%Y%m%d")
+    for plat, host in (("ashby", "jobs.ashbyhq.com/"), ("greenhouse", "job-boards.greenhouse.io/"), ("lever", "jobs.lever.co/")):
+        try:
+            raw = d.fetch(f"https://web.archive.org/cdx/search/cdx?url={host}&matchType=prefix&collapse=urlkey"
+                          f"&fl=original&from={start}&limit=50000", timeout=180)  # ponytail: 50k rows/host
+        except Exception as e:
+            print(f"  ! wayback {host}: {e}")
+            continue
+        slugs = {d._extract_slug(host, ln.strip()) for ln in (raw or b"").decode(errors="replace").splitlines()} - {""}
+        yield from _verified((plat, s) for s in slugs)
+
+
+def _harvest_urlscan():
+    after, slugs = "", set()
+    for _ in range(5):  # ponytail: 5 pages x 100 results, newest first
+        d = get_json("https://urlscan.io/api/v1/search/?q=page.domain:jobs.ashbyhq.com&size=100" + after, timeout=30) or {}
+        res = d.get("results") or []
+        for r in res:
+            m = re.match(r"jobs\.ashbyhq\.com/([a-z0-9-]+)", ((r.get("page") or {}).get("url") or r.get("task", {}).get("url") or "").split("//")[-1], re.I)
+            if m:
+                slugs.add(m.group(1).lower())
+        if len(res) < 100 or not res[-1].get("sort"):
+            break
+        after = "&search_after=" + ",".join(map(str, res[-1]["sort"]))
+    yield from _verified(("ashby", s) for s in slugs)
+
+
+def _harvest_otx():
+    slugs = set()
+    for pg in range(1, 6):  # ponytail: 5 pages x 500 urls
+        d = get_json(f"https://otx.alienvault.com/api/v1/indicator/hostname/jobs.ashbyhq.com/url_list?limit=500&page={pg}", timeout=30) or {}
+        for r in d.get("url_list") or []:
+            m = re.match(r"https?://jobs\.ashbyhq\.com/([A-Za-z0-9-]+)", r.get("url") or "")
+            if m:
+                slugs.add(m.group(1).lower())
+        if not d.get("has_next"):
+            break
+    yield from _verified(("ashby", s) for s in slugs)
+
+
+def _guess_boards(names):
+    """Company-first: names with no board -> slug guesses on ashby/greenhouse/lever -> live + name check.
+    Short slugs collide (Butter, Prism), so a hit counts only if the board's own name matches (lever has no
+    name field: accepted only when the slug is the full normalized name, >=5 chars)."""
+    import discover_boards as d
+    known = _known_slugs()
+    boards = {s for _, s in known}
+    todo = []
+    for name in dict.fromkeys(n.strip() for n in names if n and n.strip()):
+        k = re.sub(r"[^a-z0-9]", "", name.lower())
+        if len(k) < 3 or k in boards:
+            continue
+        for slug in dict.fromkeys((k, re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"))):
+            todo += [(p, slug, name) for p in ("ashby", "greenhouse", "lever") if (p, slug) not in known and d.SLUG_RE.match(slug)]
+    def one(c):
+        p, slug, name = c
+        r = _live(p, slug)
+        if r and (u.norm(r["name"]) == u.norm(name) if p != "lever" else (len(slug) >= 5 and slug == u.norm(name))):
+            return {**r, "name": name[:80]}
+    with ThreadPoolExecutor(16) as ex:
+        yield from (r for r in ex.map(one, todo[:GUESS_CAP]) if r)
+
+
+def _harvest_yc_guess():
+    f = HERE / "yc_cache.json"  # local runs; CI falls back to the public mirror
+    cos = json.load(open(f)) if f.exists() else get_json(YC_ALL, timeout=120) or []
+    cos = sorted((c for c in cos if c.get("status") == "Active"), key=lambda c: not c.get("isHiring"))  # hiring first: GUESS_CAP bites the tail
+    yield from _guess_boards(c["name"] for c in cos)
+
+
+def _harvest_formd_guess():
+    names = []
+    for f in sorted((HERE / "cache").glob("formd*.json")):  # local-only: CI has no Form D cache (gitignored), yields nothing there
+        if "seen" not in f.name:
+            names += [x.get("name") for x in json.load(open(f)) if isinstance(x, dict)]
+    yield from _guess_boards(names)
+
+
+
+def harvest_boards():
+    """The upstream lists lag by months (kalil0321 ashby.csv: last commit 2026-07-23), so a
+    board opened since is never scanned (Orpex, Sep 2026). Collect ATS links from sources that
+    update daily. Upserts, never prunes: a source going away keeps the boards it gave."""
+    rows = []
+    for src in (_harvest_simplify, _harvest_ashby_list, _harvest_hn, _harvest_chris, _harvest_wayback,
+                _harvest_urlscan, _harvest_otx, _harvest_yc_guess, _harvest_formd_guess):
+        try:
+            rows += list(src())
+        except Exception as e:  # discovery is best-effort; the scan must still run
+            print(f"  ! harvest {src.__name__}: {e}")
+    print(f"harvest: {len(rows)} board links -> {u.write_extra_boards(rows, HARVEST)} rows in {HARVEST.name}")
+
+
+NONPROD = re.compile(r"(^|[-_.])(test|dev\d*|uat|sandbox|stage)([-_.\d]|$)", re.I)  # Oracle pods: edca-test, ejta-dev5
+
+
+def all_boards(only=None):
+    seen, out = {}, []
+    # hand-added rows first: on a slug clash they win (Walmart's upstream row points at a retired wd5 pod)
+    srcs = [(None, EXTRA_BOARDS)] + [(p, HERE / "cache" / f"ats_{p}.csv") for p in PLATFORMS] + [(None, HARVEST)]
+    for plat, path in srcs:
+        if not path.exists():
+            continue
+        for r in csv.DictReader(open(path, errors="replace")):
+            p = plat or r.get("platform")
+            slug, name = (r.get("slug") or "").strip(), (r.get("name") or "").strip()
+            k = (p, slug.lower())  # ATS slugs are case-insensitive: LatchBio == latchbio
+            if k in seen and seen[k][1] and seen[k][0] == path and seen[k][1]["name"].lower() == k[1] and name.lower() != k[1]:
+                # same list, same board, first row named after an opaque slug: Oracle pod "edel" is Fortinet
+                seen[k][1]["name"] = name
+            elif p in PLATFORMS and slug and name and k not in seen and (not only or p in only):
+                if u.excluded(norm(name)) or (p == "oracle" and NONPROD.search(slug)):
+                    seen[k] = (path, None)  # marketplaces, IT services, test pods: and no later row revives it
+                    continue                # (an excluded named row would let upstream "Fa Etqo Saasfaprod1" in)
+                out.append({"p": p, "slug": slug, "name": name, "url": r.get("url") or "", "domain": r.get("domain")})
+                seen[k] = (path, out[-1])
+    out.append({"p": "hn", "slug": "whoishiring", "name": "Hacker News: Who is hiring", "url": ""})
+    return [b for b in out if not only or b["p"] in only]
+
+
+# ── fetchers: (board) -> [job] | None (definitive: no such board) ; raise Throttled ──
+def f_greenhouse(b, content=False):
+    d = get_json(f"https://boards-api.greenhouse.io/v1/boards/{b['slug']}/jobs"
+                 + ("?content=true" if content else ""), timeout=40)
+    if d is None:
+        return None
+    return [J(j["id"], j.get("title"), (j.get("location") or {}).get("name", ""), j.get("absolute_url"),
+              day(j.get("first_published") or j.get("updated_at")),
+              desc=html.unescape(j.get("content") or "") if content else None) for j in d.get("jobs", [])]
+
+
+def f_lever(b):
+    d = get_json(f"https://api.lever.co/v0/postings/{b['slug']}?mode=json", timeout=40)
+    if d is None or not isinstance(d, list):
+        return None
+    out = []
+    for j in d:
+        sr = j.get("salaryRange") or {}
+        comp = (f"{sr.get('currency', 'USD')} {sr['min']} - {sr['max']}"
+                if sr.get("min") and "year" in (sr.get("interval") or "year") else None)
+        desc = " ".join([j.get("descriptionPlain") or "", j.get("additionalPlain") or ""]
+                        + [text(l.get("content")) for l in j.get("lists", [])])
+        out.append(J(j["id"], j.get("text"), (j.get("categories") or {}).get("location", ""), j.get("hostedUrl"),
+                     day(j.get("createdAt")), j.get("workplaceType"), desc, comp))
+    return out
+
+
+def f_ashby(b):
+    d = get_json(f"https://api.ashbyhq.com/posting-api/job-board/{urllib.parse.quote(b['slug'])}?includeCompensation=true", timeout=40)
+    if d is None:
+        return None
+    out = []
+    for j in d.get("jobs", []):
+        locs = [j.get("location") or ""] + [l.get("location", "") for l in j.get("secondaryLocations") or []]
+        comp = (j.get("compensation") or {}).get("compensationTierSummary")
+        out.append(J(j.get("id"), j.get("title"), "; ".join(filter(None, locs)), j.get("jobUrl"),
+                     day(j.get("publishedAt")), j.get("workplaceType") or ("remote" if j.get("isRemote") else None),
+                     j.get("descriptionPlain") or text(j.get("descriptionHtml")), comp))
+    return out
+
+
+def f_workable(b):
+    d = get_json(f"https://apply.workable.com/api/v1/widget/accounts/{b['slug']}?details=true", timeout=40)
+    if d is None:
+        return None
+    return [J(j.get("shortcode"), j.get("title"), ", ".join(filter(None, [j.get("city"), j.get("country")])),
+              j.get("url"), day(j.get("published_on") or j.get("created_at")),
+              "remote" if j.get("telecommuting") else None, text(j.get("description"))) for j in d.get("jobs", [])]
+
+
+def f_smartrecruiters(b):
+    out, off = [], 0
+    while off < 1000:
+        d = get_json(f"https://api.smartrecruiters.com/v1/companies/{b['slug']}/postings?limit=100&offset={off}",
+                     timeout=30)
+        if d is None:
+            return None if off == 0 else out
+        for j in d.get("content", []):
+            l = j.get("location") or {}
+            out.append(J(j["id"], j.get("name"), l.get("fullLocation") or ", ".join(filter(None, [l.get("city"), l.get("country")])),
+                         f"https://jobs.smartrecruiters.com/{b['slug']}/{j['id']}", day(j.get("releasedDate")),
+                         "remote" if l.get("remote") else ("hybrid" if l.get("hybrid") else None)))
+        off += 100
+        if off >= (d.get("totalFound") or 0):
+            break
+    return out
+
+
+def d_smartrecruiters(b, j):
+    d = get_json(f"https://api.smartrecruiters.com/v1/companies/{b['slug']}/postings/{j['id']}", timeout=20) or {}
+    secs = ((d.get("jobAd") or {}).get("sections") or {}).values()
+    return " ".join(text(s.get("text")) for s in secs if isinstance(s, dict))
+
+
+def _wd(b):
+    host = urllib.parse.urlparse(b["url"]).netloc
+    tenant, site = b["slug"].split("/", 1)
+    return host, f"https://{host}/wday/cxs/{tenant}/{site}", site
+
+
+def _wd_posted(s):
+    s = (s or "").lower()
+    if "today" in s:
+        return TODAY
+    if "yesterday" in s:
+        return (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    m = re.search(r"(\d+) days? ago", s)
+    if m and "+" not in s:
+        return (datetime.date.today() - datetime.timedelta(days=int(m.group(1)))).isoformat()
+    return None  # "30+ Days Ago": older than a month, date unknown
+
+
+# Workday pages are 20 postings at ~2 s each and tenants include hospitals and retailers;
+# searching server-side for technical titles cuts the page count for non-tech tenants
+# ~10x. OR is honoured (measured: NVIDIA "engineer scientist" 137 vs "engineer OR scientist" 2000).
+# ponytail: product managers at Workday tenants are missed; add "product manager" if wanted.
+WD_QUERY = "engineer OR engineering OR developer OR scientist OR architect OR researcher OR programmer"
+
+
+# Workday serves at most 2,000 results per search: later offsets repeat the last page and `total`
+# reads 2000 (NVIDIA: 4,000 fetched, 2,000 distinct; its job-family facet sums to 2,649).
+WD_MAX = 2000
+# a tenant moved to another pod answers 422 on its old one (Walmart wd5 -> wd504, Alight, CMU -> wd115).
+# ponytail: every pod in the 2026-10 board list; a tenant moved to a pod not listed here stays missing.
+WD_PODS = ("wd1", "wd3", "wd5", "wd10", "wd12", "wd102", "wd103", "wd105", "wd107", "wd108", "wd115", "wd116",
+           "wd501", "wd502", "wd503", "wd504")
+
+
+def _wd_split(facets):
+    """-> (facet, [value ids]) whose every value holds < WD_MAX results, so each part is served whole.
+    Location facets nest one level under a group. Most coverage wins; a value list of 50+ may be truncated."""
+    flat = [f for g in facets or [] for f in
+            ([v for v in g.get("values") or [] if v.get("facetParameter")] or [g])]
+    ok = [f for f in flat if f.get("values") and all((v.get("count") or 0) < WD_MAX for v in f["values"])]
+    best = max(ok, key=lambda f: (len(f["values"]) < 50, sum(v.get("count") or 0 for v in f["values"])), default=None)
+    return best and (best["facetParameter"], [v["id"] for v in best["values"] if v.get("count") and v.get("id")])
+
+
+def _wd_repod(b):
+    """Point b at the pod its tenant answers on now (mutated: the detail fetches reuse b). -> moved?"""
+    m = re.match(r"([\w-]+)\.(wd\d+)\.myworkdayjobs\.com$", urllib.parse.urlparse(b["url"]).netloc)
+    if not m or b.get("moved"):
+        return False
+    tenant, old = m.groups()
+    site = b["slug"].split("/", 1)[1]
+    probe = json.dumps({"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""}).encode()
+    for pod in WD_PODS:
+        host = f"{tenant}.{pod}.myworkdayjobs.com"
+        if pod != old and get_json(f"https://{host}/wday/cxs/{tenant}/{site}/jobs", timeout=15, headers=JSONH,
+                                   data=probe, retries=1) is not None:
+            print(f"  workday {b['slug']}: moved {old} -> {pod}")
+            b.update(url=f"https://{host}/{site}", moved=True)
+            return True
+    b["moved"] = "gone"  # probed once; not again this run
+    return False
+
+
+def f_workday(b, q=WD_QUERY, facet=None):
+    if "/" not in b["slug"] or not b["url"]:
+        return None
+    host, api, site = _wd(b)
+    out, off, total = [], 0, None
+    while off < WD_MAX:
+        d = get_json(f"{api}/jobs", timeout=30, headers=JSONH,
+                     data=json.dumps({"appliedFacets": facet or {}, "limit": 20, "offset": off, "searchText": q}).encode())
+        if d is None:
+            if off == 0 and not facet and _wd_repod(b):
+                return f_workday(b, q)
+            return None if off == 0 else out
+        total = total or d.get("total") or 0  # Workday reports total on page 1 only
+        # ~1 in 6 tenants don't honour OR and answer 0 (Palo Alto Networks: 0 vs 1,071 for "engineer").
+        # Search is full-text, so "engineer" alone finds 495 of its 497 technical titles.
+        if not total and q == WD_QUERY and not facet:
+            return f_workday(b, "engineer")
+        if total >= WD_MAX and not facet and (split := _wd_split(d.get("facets"))):
+            seen = {}  # a posting can sit under two values (multi-location)
+            for v in split[1]:
+                for j in f_workday(b, q, {split[0]: [v]}) or []:
+                    seen.setdefault(j["id"], j)
+            return list(seen.values())
+        posts = d.get("jobPostings") or []
+        for j in posts:
+            path = j.get("externalPath") or ""
+            out.append(J(path, j.get("title"), j.get("locationsText", ""), f"https://{host}/{site}{path}",
+                         _wd_posted(j.get("postedOn"))))
+        off += 20
+        if not posts or off >= total:
+            break
+    return out
+
+
+def _wd_selfcheck():
+    """f_workday against a fake tenant: OR fallback, >2k facet split, pod move. No network."""
+    global get_json
+    real, calls = get_json, []
+    post = lambda ids: [{"externalPath": f"/job/{x}", "title": f"Engineer {x}"} for x in ids]
+
+    def fake(url, data=None, **kw):
+        q = json.loads(data)
+        calls.append((url, q["searchText"], q["appliedFacets"]))
+        if ".wd5." in url:
+            return None  # retired pod: 422
+        if q["searchText"] == WD_QUERY:
+            return {"total": 0, "jobPostings": []}  # tenant doesn't honour OR
+        fam = q["appliedFacets"].get("jobFamilyGroup", [None])[0]
+        ids = {None: range(0, 20), "a": range(0, 20), "b": range(15, 30)}[fam]  # 15-19 under both values
+        page = list(ids)[q["offset"]:q["offset"] + 20]
+        return {"total": 2000 if fam is None else len(ids), "jobPostings": post(page),
+                "facets": [{"facetParameter": "timeType", "values": [{"id": "ft", "count": 2400}]},
+                           {"facetParameter": "jobFamilyGroup", "values": [{"id": "a", "count": 20}, {"id": "b", "count": 15}]}]}
+    get_json = fake
+    try:
+        b = {"p": "workday", "slug": "acme/ext", "name": "Acme", "url": "https://acme.wd5.myworkdayjobs.com/ext"}
+        js = f_workday(b)
+        assert b["url"] == "https://acme.wd1.myworkdayjobs.com/ext", b  # wd5 422 -> first pod that answers
+        assert sorted(int(j["id"].rsplit("/", 1)[1]) for j in js) == list(range(30)), js  # split, deduped
+        assert {c[1] for c in calls if c[2]} == {"engineer"}, calls  # split reuses the fallback query
+    finally:
+        get_json = real
+    print("jobs: workday selfcheck OK")
+
+
+def d_workday(b, j):
+    _, api, _ = _wd(b)
+    d = (get_json(f"{api}{j['id']}", timeout=20) or {}).get("jobPostingInfo") or {}
+    locs = [d.get("location") or ""] + list(d.get("additionalLocations") or [])
+    if locs[0]:
+        j["loc"] = "; ".join(filter(None, locs))
+    j["remote"] = d.get("remoteType") or j["remote"]
+    j["posted"] = day(d.get("startDate")) or j["posted"]
+    return text(d.get("jobDescription"))
+
+
+def f_bamboohr(b):
+    d = get_json(f"https://{b['slug']}.bamboohr.com/careers/list", timeout=30)
+    if d is None:
+        return None
+    out = []
+    for j in d.get("result") or []:
+        l, a = j.get("location") or {}, j.get("atsLocation") or {}
+        loc = ", ".join(filter(None, [l.get("city") or a.get("city"), l.get("state") or a.get("state"), a.get("country")]))
+        out.append(J(j["id"], j.get("jobOpeningName"), loc, f"https://{b['slug']}.bamboohr.com/careers/{j['id']}",
+                     remote="remote" if j.get("isRemote") else None))
+    return out
+
+
+def f_rippling(b):
+    out, page = [], 0
+    while page < 20:
+        d = get_json(f"https://ats.rippling.com/api/v2/board/{b['slug']}/jobs?page={page}", timeout=30)
+        if d is None:
+            return None if page == 0 else out
+        for j in d.get("items") or []:
+            ls = j.get("locations") or []
+            out.append(J(j["id"], j.get("name"), "; ".join(l.get("name", "") for l in ls), j.get("url"),
+                         remote=next((l.get("workplaceType") for l in ls if l.get("workplaceType")), None)))
+        page += 1
+        if page >= (d.get("totalPages") or 1):
+            break
+    return out
+
+
+def f_personio(b):
+    raw = get_bytes(f"https://{b['slug']}.jobs.personio.com/xml?language=en", timeout=40)
+    if raw is None:
+        return None
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+    out = []
+    for p in root.iter("position"):
+        g = lambda k: (p.findtext(k) or "").strip()
+        offices = [g("office")] + [o.text or "" for o in p.findall("additionalOffices/office")]
+        desc = " ".join(text(v.text) for v in p.findall("jobDescriptions/jobDescription/value"))
+        out.append(J(g("id"), g("name"), "; ".join(filter(None, offices)),
+                     f"https://{b['slug']}.jobs.personio.com/job/{g('id')}", day(g("createdAt")), desc=desc))
+    return out
+
+
+def f_teamtailor(b):
+    url, out, pages = f"https://{b['slug']}.teamtailor.com/jobs.json", [], 0
+    while url and pages < 10:
+        d = get_json(url, timeout=30)
+        if d is None:
+            return None if pages == 0 else out
+        for j in d.get("items") or []:
+            out.append(J(j.get("id"), j.get("title"), "", j.get("url"), day(j.get("date_published")),
+                         desc=text(j.get("content_html"))))
+        url, pages = d.get("next_url"), pages + 1
+    return out
+
+
+def f_breezy(b):
+    d = get_json(f"https://{b['slug']}.breezy.hr/json", timeout=30)
+    if d is None or not isinstance(d, list):
+        return None
+    return [J(j["id"], j.get("name"), (j.get("location") or {}).get("name", ""), j.get("url"),
+              day(j.get("published_date")), "remote" if (j.get("location") or {}).get("is_remote") else None,
+              comp=j.get("salary") or None) for j in d]
+
+
+def f_recruitee(b):
+    d = get_json(f"https://{b['slug']}.recruitee.com/api/offers/", timeout=30)
+    if d is None:
+        return None
+    out = []
+    for j in d.get("offers") or []:
+        sal = j.get("salary") or {}
+        comp = (f"{sal.get('currency') or ''} {sal.get('min')} - {sal.get('max')}"
+                if isinstance(sal, dict) and sal.get("min") and sal.get("period") in (None, "year") else None)
+        out.append(J(j["id"], j.get("title"), j.get("location") or ", ".join(filter(None, [j.get("city"), j.get("country")])),
+                     j.get("careers_url"), day(j.get("published_at") or j.get("created_at")),
+                     "remote" if j.get("remote") else ("hybrid" if j.get("hybrid") else None),
+                     text(j.get("description")) + " " + text(j.get("requirements")), comp))
+    return out
+
+
+HN_ROLE = re.compile(r"engineer|developer|scientist|researcher|architect|sre|devops|ml|ai\b", re.I)
+
+
+def f_hn(b):
+    """Monthly 'Ask HN: Who is hiring?' — every post is written by the employer itself,
+    so it passes the rule that excluded aggregators, and it reaches companies with no ATS."""
+    s = get_json("https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=10")
+    hit = next((h for h in (s or {}).get("hits", []) if "who is hiring" in (h.get("title") or "").lower()), None)
+    if not hit:
+        return None
+    d = get_json(f"https://hn.algolia.com/api/v1/items/{hit['objectID']}", timeout=40) or {}
+    out = []
+    for c in d.get("children") or []:
+        raw = c.get("text") or ""
+        if not raw or c.get("author") is None:
+            continue
+        header = text(re.split(r"<p>", raw, maxsplit=1)[0]).strip()
+        parts = [p.strip() for p in header.split("|") if p.strip()]
+        if len(parts) < 2 or len(parts[0]) > 60:
+            continue  # not the conventional "Company | Role | Location" header
+        role = next((p for p in parts[1:] if F.family(p)), None) or next((p for p in parts[1:] if HN_ROLE.search(p)), parts[1])
+        loc = "; ".join(p for p in parts[1:] if F.countries(p) or F.REMOTE.search(p) or F.HYBRID.search(p))
+        out.append(J(c["id"], role[:140], loc, f"https://news.ycombinator.com/item?id={c['id']}",
+                     day(c.get("created_at")), "remote" if F.REMOTE.search(header) else None,
+                     text(raw), co=re.sub(r"\s*(\(.*?\)|https?://\S+)\s*", " ", parts[0]).strip()[:60]))
+    return out
+
+
+FETCH = {"greenhouse": f_greenhouse, "lever": f_lever, "ashby": f_ashby, "workable": f_workable,
+         "smartrecruiters": f_smartrecruiters, "workday": f_workday, "bamboohr": f_bamboohr,
+         "rippling": f_rippling, "personio": f_personio, "teamtailor": f_teamtailor, "breezy": f_breezy,
+         "recruitee": f_recruitee, "hn": f_hn}
+DETAIL = {"workday": d_workday, "smartrecruiters": d_smartrecruiters}
+
+
+def load_extra():
+    """fetchers_extra imports J/day/text from this module, so it is loaded lazily."""
+    from fetchers_extra import EXTRA_FETCH
+    FETCH.update(EXTRA_FETCH)
+
+
+# ── scan ─────────────────────────────────────────────────────────────────────
+class Scan:
+    def __init__(self, ledger):
+        # postings whose description we've read. One flagged `clearance` under older rules is read once more:
+        # the flag hides the job downstream, and v1 set it on "US Citizenship Required: No".
+        self.known = {k for k, j in ledger.items()
+                      if j.get("d") and not (j["d"] < FACTS_V and "clearance" in (j.get("fl") or ()))}
+        self.detail_budget, self.lock = DETAIL_CAP, threading.Lock()
+
+    def _take_detail(self):
+        with self.lock:
+            if self.detail_budget <= 0:
+                return False
+            self.detail_budget -= 1
+            return True
+
+    def board(self, b):
+        """-> (board, jobs | None | "fail"). Descriptions are fetched only for technical
+        postings we haven't read before, so steady-state runs stay cheap."""
+        p = b["p"]
+        try:
+            jobs = FETCH[p](b)
+            if not jobs:
+                return b, jobs
+            fresh = [j for j in jobs if F.family(j["title"]) and f"{p}:{b['slug']}:{j['id']}" not in self.known]
+            if p == "greenhouse" and fresh:
+                full = {j["id"]: j for j in f_greenhouse(b, content=True) or []}
+                for j in jobs:
+                    j["desc"] = (full.get(j["id"]) or {}).get("desc")
+            elif p in DETAIL:
+                for j in fresh:
+                    if self._take_detail():
+                        try:
+                            j["desc"] = DETAIL[p](b, j)
+                        except Throttled:
+                            pass  # listing still counts; description retried next run
+            return b, jobs
+        except Throttled:
+            return b, "fail"
+        except Exception as e:  # malformed payload from one board must not sink the scan
+            print(f"  ! {p}/{b['slug']}: {type(e).__name__}: {e}")
+            return b, "fail"
+
+
+def scan_all(boards, workers, ledger):
+    """One pool per platform: the throttle that cost 2.5k boards at 32 workers is per API
+    host, so platforms run side by side, each at `workers`."""
+    sc, by_p = Scan(ledger), defaultdict(list)
+    for b in boards:
+        by_p[b["p"]].append(b)
+    results, t0 = [], time.time()
+
+    def run(p):
+        # Workday tenants sit on many hosts (wd1..wd12, per-tenant subdomains) and each page is
+        # slow, so it tolerates — and needs — twice the concurrency of a single-host API.
+        # Workable throttles hard: 12 workers left 928 of 4,752 boards (20%) unanswered.
+        # Eightfold sits behind one CloudFront WAF: 12 workers got every tenant 403-blocked, and
+        # 4 still left 60 of 81 throttled in CI (2026-10-12), so it runs on one worker (max(1, 0)).
+        with ThreadPoolExecutor(max(1, int(workers * WORKER_SCALE.get(p, 1)))) as ex:
+            r = list(ex.map(sc.board, by_p[p]))
+        fails = sum(1 for _, j in r if j == "fail")
+        print(f"  {p:<16} {len(r):>5} boards  {sum(1 for _, j in r if j and j != 'fail'):>5} live  "
+              f"{fails:>4} throttled  ({time.time() - t0:.0f}s)")
+        return r
+
+    with ThreadPoolExecutor(len(by_p)) as ex:
+        for r in ex.map(run, list(by_p)):
+            results += r
+    return results
+
+
+# ── ledger ───────────────────────────────────────────────────────────────────
+def reclassify(ledger):
+    """Title-only facts are recomputed every run, so a rule change in features.py applies
+    to the whole ledger without a rescan (description-derived facts are redone when a posting's
+    description is next read: bump FACTS_V)."""
+    for k in list(ledger):
+        j = ledger[k]
+        fam = F.family(j["t"])
+        if not fam or u.excluded(j["ck"]):
+            del ledger[k]
+            continue
+        j["f"], j["lv"] = fam, F.level(j["t"])
+    # bare "Staff Engineer" is software at a software employer (see F.employer_default)
+    fams = defaultdict(Counter)
+    for j in ledger.values():
+        if not j.get("cl"):
+            fams[j["ck"]][j["f"]] += 1
+    for j in ledger.values():
+        if j["f"] == "other-eng" and F.employer_default(j["t"], fams[j["ck"]]):
+            j["f"] = "backend"
+
+
+def load_state():
+    ledger = json.load(gzip.open(LEDGER)) if LEDGER.exists() else {}
+    hist = json.load(open(HISTORY)) if HISTORY.exists() else {}
+    return ledger, hist
+
+
+def facts(p, j, company):
+    """User-independent facts for one posting (see features.py)."""
+    blob = " ".join(filter(None, [j.get("desc"), j.get("comp")]))
+    workplace, scope, flags = F.eligibility(j["loc"], j["remote"], blob)
+    pay = F.pay(j.get("comp") or "") or F.pay(j.get("desc") or "")
+    return {"f": F.family(j["title"]), "lv": F.level(j["title"]), "cc": F.countries(j["loc"]),
+            "wp": workplace, "sc": scope, "fl": flags, "pay": list(pay) if pay else None,
+            "sk": F.skills(j["title"] + " " + (j.get("desc") or "")), "d": FACTS_V if j.get("desc") else 0}
+
+
+def merge(ledger, results):
+    """Fold one scan into the ledger. Returns per-board stats for boards.json."""
+    open_by_board, known_boards = defaultdict(set), {(j["p"], j["s"]) for j in ledger.values()}
+    for k, j in ledger.items():
+        if not j.get("cl"):
+            open_by_board[(j["p"], j["s"])].add(k)
+    recent_closed = {(j["ck"], j["t"].lower()): j for j in ledger.values()
+                     if j.get("cl") and j["cl"] >= _ago(14)}
+    stats, n_new, n_closed = {}, 0, 0
+    for b, jobs in results:
+        bk = (b["p"], b["slug"])
+        if jobs == "fail":
+            continue  # carried forward untouched
+        live = set()
+        # a board we've never read (first run, or newly listed upstream): its postings aren't
+        # new today, they're new to us — date them by their own posted date
+        bootstrap = bk not in known_boards
+        for j in jobs or []:
+            fam = F.family(j["title"])
+            if not fam:
+                continue
+            k = f"{b['p']}:{b['slug']}:{j['id']}"
+            live.add(k)
+            co = j.get("co") or b["name"]
+            prev = ledger.get(k)
+            if prev and not prev.get("cl"):
+                prev["ls"] = TODAY
+                # co too: a board renamed upstream (Edel -> Fortinet) must rename its open postings
+                prev.update(t=j["title"], loc=j["loc"] or prev["loc"], co=co, ck=norm(co))
+                if j.get("desc") and (prev.get("d") or 0) < FACTS_V:
+                    prev.update(facts(b["p"], j, co))
+                continue
+            rec = {"p": b["p"], "s": b["slug"], "co": co, "ck": norm(co), "t": j["title"], "loc": j["loc"],
+                   "u": j["url"], "po": j["posted"], "fs": (j["posted"] or BACKFILL) if bootstrap else TODAY,
+                   "ls": TODAY, **facts(b["p"], j, co)}
+            twin = recent_closed.get((rec["ck"], rec["t"].lower()))
+            if twin:  # same title re-opened within 2 weeks of closing: a repost, not new headcount
+                rec["rp"] = twin.get("po") or twin["fs"]
+            ledger[k] = rec
+            n_new += 1
+        for k in open_by_board.get(bk, set()) - live:
+            ledger[k]["cl"] = TODAY
+            n_closed += 1
+        titles = [(j["title"], j["loc"]) for j in jobs or []]
+        if titles and b["p"] != "hn":
+            total, ai_n, ai_titles, india = u.analyze_jobs(titles)
+            india_ai = len({t.strip() for t, loc in titles if u.AI_ROLE.search(t)
+                            and not u.NOT_AI_ROLE.search(t) and u.INDIA.search(loc or "")})
+            stats[bk] = {"name": b["name"], "ats": b["p"], "slug": b["slug"], "url": b["url"], "open_roles": total,
+                         "ai_roles": ai_n, "ai_titles": ai_titles, "india_jobs": india, "india_ai_roles": india_ai}
+        elif b["p"] != "hn":
+            stats[bk] = {"name": b["name"], "empty": True}  # answered, genuinely empty
+    for k in [k for k, j in ledger.items() if j.get("cl") and j["cl"] < _ago(CLOSED_KEEP_DAYS)]:
+        del ledger[k]
+    print(f"ledger: {sum(1 for j in ledger.values() if not j.get('cl'))} open technical postings, "
+          f"+{n_new} new, -{n_closed} closed today")
+    return stats
+
+
+# first-seen stamp for an undated posting on a board we'd never read: it existed before we
+# started tracking, so it must not count as "new today" (31.8k false NEWs on the first run)
+BACKFILL = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+
+
+def _ago(days):
+    return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+
+
+def write_boards_json(stats):
+    """Keep unicorn_radar.py's input contract (was boards.py's output)."""
+    out = HERE / "cache" / "boards.json"
+    prior = json.load(open(out)).get("boards", {}) if out.exists() else {}
+    by_key, observed = {}, set()
+    for r in stats.values():
+        k = norm(r["name"])
+        observed.add(k)  # answered definitively: has jobs, or genuinely has none
+        if k and not r.get("empty") and (k not in by_key or r["ai_roles"] > by_key[k]["ai_roles"]):
+            by_key[k] = r
+    for k, rec in prior.items():
+        if k not in by_key and k not in observed:
+            by_key[k] = rec  # throttled this run: keep what we knew
+    json.dump({"generated": TODAY, "boards": by_key}, open(out, "w"))
+
+
+# ── company history, pay tier, events ───────────────────────────────────────
+def _board_url(boards):
+    """URL to ask Wayback about for an employer's {(platform, slug)} boards; None unless every
+    board is on a startup ATS (an employer also on Workday is not a new company)."""
+    if boards and all(p in BOARD_URL and s for p, s in boards):
+        p, s = min(boards)
+        return BOARD_URL[p].format(s)
+
+
+def _wayback_old(url):
+    """Date (YYYY-MM-DD) of a Wayback capture of `url` or any page under it from before
+    WAYBACK_NEW_DAYS ago; "" if there is none; None if Wayback didn't answer. A prefix query, as
+    the bare board root is often never archived while its job pages are (Guild, TrueLink)."""
+    b = get_bytes(f"https://web.archive.org/cdx/search/cdx?matchType=prefix&limit=1&fl=timestamp"
+                  f"&to={_ago(WAYBACK_NEW_DAYS).replace('-', '')}&url=" + urllib.parse.quote(url, safe=""),
+                  timeout=30, retries=1)
+    t = b.decode(errors="replace").strip() if b is not None else None
+    return None if t is None or (t and not t[:8].isdigit()) else t and f"{t[:4]}-{t[4:6]}-{t[6:8]}"
+
+
+def _new_co(h):
+    """A new employer: every technical posting under NEW_BOARD_DAYS old, on a startup ATS (only
+    those get a "wb"), and no Wayback capture of its board from before WAYBACK_NEW_DAYS ago. ATS
+    feeds list open jobs only, so posting dates alone made JPMorgan and Bosch look new (1,318 of 12,992)."""
+    return (h.get("born") or "") >= _ago(NEW_BOARD_DAYS) and h.get("wb") == ""
+
+
+def _newco_selfcheck():
+    """New-company rule on fake history + a fake Wayback. No network."""
+    global get_bytes
+    assert _board_url({("ashby", "acme")}) == "jobs.ashbyhq.com/acme"
+    assert _board_url({("ashby", "acme"), ("workday", "acme/ext")}) is None  # also on an enterprise ATS
+    assert _board_url({("kula", "")}) is None and _board_url(set()) is None
+    new, old = _ago(5), _ago(NEW_BOARD_DAYS + 1)
+    assert _fresh({"po": _ago(MAX_AGE_DAYS)}) and not _fresh({"po": _ago(MAX_AGE_DAYS + 1)})
+    assert _fresh({"po": None}) and _fresh({"po": "2025-04-14", "rp": "2025-01-01"})  # unknown / repost pass
+    assert _new_co({"born": new, "wb": ""})
+    assert not _new_co({"born": new, "wb": _ago(WAYBACK_NEW_DAYS + 1)})  # board archived long ago: old firm
+    assert not _new_co({"born": old, "wb": ""}) and not _new_co({"born": new})  # old posting / not looked up
+    real = get_bytes
+    answers = {"jobs.ashbyhq.com/fresh": b"", "jobs.lever.co/old": b"20190304101010\n"}
+    get_bytes = lambda url, **kw: answers[urllib.parse.unquote(url.rsplit("url=", 1)[1])]
+    try:
+        led = {f"{p}:{s}:1": {"p": p, "s": s, "co": s.title(), "ck": s, "po": po, "fs": TODAY, "cc": [], "lv": 2}
+               for p, s, po in [("ashby", "fresh", new), ("lever", "old", new), ("workday", "big/ext", new),
+                                ("greenhouse", "aged", old)]}
+        h = update_history(led, {"companies": {"seen": {"cc": [], "staff": False, "n": {}}}})
+        c = h["companies"]
+        assert c["fresh"]["wb"] == "" and c["old"]["wb"] == "2019-03-04", c
+        assert "wb" not in c["big/ext"] and "wb" not in c["aged"], c  # enterprise ATS / old posting: no lookup
+        assert {e["ck"] for e in h["events"] if e["type"] == "new-board"} == {"fresh"}, h["events"]
+    finally:
+        get_bytes = real
+    print("jobs: new-company selfcheck OK")
+
+
+def update_history(ledger, hist):
+    """Per-company memory the ledger alone can't hold: countries ever hired in, whether a
+    Staff+ role ever appeared, a daily technical-headcount series, board age. Emits today's events."""
+    cos = hist.setdefault("companies", {})
+    events = [e for e in hist.get("events", []) if e["date"] >= _ago(60)]
+    first_run = not cos
+    by_co, born, boards = defaultdict(list), {}, defaultdict(set)
+    for j in ledger.values():
+        d = j.get("po") or j["fs"]
+        born[j["ck"]] = min(born.get(j["ck"], d), d)
+        if not j.get("cl"):
+            by_co[j["ck"]].append(j)
+            boards[j["ck"]].add((j["p"], j["s"]))
+    ask = []  # (ck, board url) still to look up on Wayback
+    for ck, js in by_co.items():
+        fresh = ck not in cos  # first time we read this employer: its countries/Staff+ roles aren't news
+        h = cos.setdefault(ck, {"cc": [], "staff": False, "n": {}})
+        h["born"] = min(h.get("born") or born[ck], born[ck])  # earliest technical posting ever seen
+        if "wb" not in h and h["born"] >= _ago(NEW_BOARD_DAYS) and _board_url(boards[ck]):
+            ask.append((ck, _board_url(boards[ck])))
+        cc_now = {c for j in js for c in j["cc"]}
+        staff_now = any(j["lv"] >= 4 for j in js)
+        name = js[0]["co"]
+        if not first_run:
+            for c in sorted(cc_now - set(h["cc"])) if not fresh else []:
+                events.append({"date": TODAY, "ck": ck, "co": name, "type": "new-country", "detail": c})
+            if staff_now and not h["staff"] and not fresh:
+                events.append({"date": TODAY, "ck": ck, "co": name, "type": "first-staff",
+                               "detail": next(j["t"] for j in js if j["lv"] >= 4)})
+            before = h["n"].get(_ago(14)) or h["n"].get(_ago(13)) or h["n"].get(_ago(15))
+            if before and len(js) >= before * 1.5 and len(js) - before >= 5:
+                events.append({"date": TODAY, "ck": ck, "co": name, "type": "build-out",
+                               "detail": f"{before} → {len(js)} technical openings in 2 weeks"})
+        h["cc"] = sorted(set(h["cc"]) | cc_now)
+        h["staff"] = h["staff"] or staff_now
+        h["n"][TODAY] = len(js)
+        h["n"] = {d: n for d, n in h["n"].items() if d >= _ago(45)}
+    # ponytail: WAYBACK_CAP lookups in WAYBACK_SECONDS per run, freshest first, 4 at a time; a bigger backlog
+    # drains over days. CDX took 10-30 s a lookup and answered bursts with 503 (2026-10-12); a miss isn't
+    # cached, so it is retried next run. Raise the cap/budget if new-board backlogs outlive NEW_BOARD_DAYS.
+    todo, deadline = sorted(ask, key=lambda a: cos[a[0]]["born"], reverse=True)[:WAYBACK_CAP], time.time() + WAYBACK_SECONDS
+
+    def look(a):
+        try:
+            return _wayback_old(a[1]) if time.time() < deadline else None
+        except Throttled:
+            return None
+    with ThreadPoolExecutor(4) as ex:
+        found = list(zip(todo, ex.map(look, todo)))
+    print(f"wayback: {sum(w is not None for _, w in found)} of {len(ask)} new-board candidates looked up")
+    for (ck, url), wb in found:
+        if wb is None:
+            continue
+        h = cos[ck]
+        h["wb"] = wb
+        if _new_co(h) and not first_run:  # each board is looked up once, so this fires once
+            js = by_co[ck]
+            events.append({"date": TODAY, "ck": ck, "co": js[0]["co"], "type": "new-board",
+                           "detail": f"first posting {h['born']} · {len(js)} technical opening{'s' * (len(js) > 1)}"
+                                     f" · {url} not archived before {_ago(WAYBACK_NEW_DAYS)}"})
+    events += india_entity_events({e["ck"] for e in events if e["type"] == "new-india-entity"}, by_co)
+    hist["events"] = events
+    return hist
+
+
+def india_entity_events(already, by_co):
+    """A new Indian subsidiary is registered before the first Indian posting appears
+    (87% of registered entities show no India roles yet) — a founding-team lead."""
+    p = HERE / "cache" / "mca_subs.json"
+    if not p.exists():
+        return []
+    recs = json.load(open(p))
+    recs = recs.get("records", recs) if isinstance(recs, dict) else recs
+    stems = {u.stem(js[0]["co"]): (ck, js[0]["co"]) for ck, js in by_co.items() if len(u.stem(js[0]["co"])) >= 5}
+    out = []
+    for r in recs:
+        dt = str(r.get("CompanyRegistrationdate_date") or "")[:10]
+        if dt < _ago(180):
+            continue
+        hit = stems.get(u.stem(r.get("CompanyName") or r.get("company_name") or ""))
+        if hit and hit[0] not in already:
+            out.append({"date": dt, "ck": hit[0], "co": hit[1], "type": "new-india-entity",
+                        "detail": (r.get("CompanyName") or "").title()})
+    return out
+
+
+def company_stats(ledger):
+    """pay tier from the company's own posted bands; median days-to-close; counts."""
+    tops, closes, counts = defaultdict(list), defaultdict(list), Counter()
+    for j in ledger.values():
+        if j.get("pay"):
+            tops[j["ck"]].append(F.pay_rank(j["pay"]))
+        if j.get("cl") and not j.get("rp"):
+            start = j.get("po") or j["fs"]
+            closes[j["ck"]].append((datetime.date.fromisoformat(j["cl"]) - datetime.date.fromisoformat(start)).days)
+        elif not j.get("cl"):
+            counts[j["ck"]] += 1
+    out = {}
+    for ck in set(tops) | set(closes) | set(counts):
+        t = sorted(x for x in tops.get(ck, []) if x)
+        top = t[int(len(t) * 0.75)] if t else None  # p75 of top-of-band across its postings
+        out[ck] = {"pay_top": top,
+                   "pay_tier": None if not top else "top" if top >= 300_000 else "high" if top >= 220_000
+                   else "mid" if top >= 150_000 else "low",
+                   "ttc": round(statistics.median(closes[ck])) if len(closes.get(ck, [])) >= 3 else None,
+                   "tech_open": counts.get(ck, 0)}
+    return out
+
+
+# ── export ───────────────────────────────────────────────────────────────────
+# Row layout of web/data/jobs/<family>.json. Compact on purpose: 160k postings shipped as
+# plain dicts were 42 MB. Dates are days before `generated`; URLs are the employer's `up`
+# prefix + suffix; skills index into index.json's `skills`.
+JOB_COLS = ["t", "c", "lv", "loc", "cc", "wp", "sc", "fl", "pay", "po", "fs", "rp", "sk", "u", "src"]
+UNPUBLISHED = {"other-eng"}  # electrical/civil/quality engineering: kept in the ledger, not shipped
+MAX_AGE_DAYS = 90  # posted longer ago = stale or evergreen: kept in the ledger, not shipped
+
+
+def _fresh(j):
+    """Unknown posted date and reposts (live hiring) pass, same rule as qrious-hire's gate."""
+    return not j.get("po") or bool(j.get("rp")) or j["po"] >= _ago(MAX_AGE_DAYS)
+
+
+def _off(d):
+    return (datetime.date.fromisoformat(TODAY) - datetime.date.fromisoformat(d)).days if d else None
+
+
+def export(ledger, hist, cstats):
+    out_dir = WEB / "data" / "jobs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    comp_path = WEB / "data" / "companies.json"
+    companies = [c for c in (json.load(open(comp_path)) if comp_path.exists() else []) if not u.excluded(norm(c["name"]))]
+    cidx = {norm(c["name"]): i for i, c in enumerate(companies)}
+    live = sorted((j for j in ledger.values() if not j.get("cl") and j["f"] not in UNPUBLISHED and _fresh(j)),
+                  key=lambda j: j.get("po") or j["fs"], reverse=True)
+    urls = defaultdict(list)
+    for j in live:
+        urls[j["ck"]].append(j["u"] or "")
+    employers, eidx = [], {}
+    for j in live:
+        if j["ck"] in eidx:
+            continue
+        s = cstats.get(j["ck"]) or {}
+        pre = os.path.commonprefix(urls[j["ck"]])
+        pre = pre[:pre.rfind("/") + 1] if len(urls[j["ck"]]) > 1 else ""
+        eidx[j["ck"]] = len(employers)
+        employers.append({"n": j["co"], "ci": cidx.get(j["ck"], -1), "pt": s.get("pay_tier"),
+                          "ptop": s.get("pay_top"), "ttc": s.get("ttc"), "up": pre})
+        h = hist.get("companies", {}).get(j["ck"]) or {}
+        if _new_co(h):
+            employers[-1]["b"] = _off(h["born"])  # days since a new employer's first technical posting
+    skill_names = sorted(F.SKILLS)
+    sk_i = {k: i for i, k in enumerate(skill_names)}
+    shards = defaultdict(list)
+    for j in live:
+        e = employers[eidx[j["ck"]]]
+        shards[j["f"]].append([j["t"], eidx[j["ck"]], j["lv"], j["loc"][:80], ",".join(j["cc"]), j["wp"], j["sc"],
+                               ",".join(j["fl"]), j["pay"], _off(j.get("po")), _off(j["fs"]), _off(j.get("rp")),
+                               [sk_i[k] for k in j["sk"] if k in sk_i], (j["u"] or "")[len(e["up"]):], j["p"]])
+    for old in out_dir.glob("*.json"):
+        old.unlink()
+    for fam, rows in shards.items():
+        json.dump({"rows": rows}, open(out_dir / f"{fam}.json", "w"), separators=(",", ":"))
+    json.dump({"generated": TODAY, "cols": JOB_COLS, "employers": employers, "skills": skill_names,
+               "families": {f: len(r) for f, r in shards.items()}},
+              open(out_dir / "index.json", "w"), separators=(",", ":"))
+    # company-level fields refreshed daily without a full unicorn_radar.py rebuild
+    for c in companies:
+        ck = norm(c["name"])
+        s = cstats.get(ck) or {}
+        c.update(pay_top=s.get("pay_top"), pay_tier=s.get("pay_tier"), ttc=s.get("ttc"),
+                 tech_open=s.get("tech_open", 0))
+        wk = ((hist.get("companies", {}).get(ck) or {}).get("n") or {}).get(_ago(7))
+        c["tech_delta_7d"] = (s.get("tech_open", 0) - wk) if wk is not None else None
+    json.dump(companies, open(comp_path, "w"), separators=(",", ":"))
+    export_skills(ledger, cstats)
+    json.dump(sorted(hist.get("events", []), key=lambda e: e["date"], reverse=True),
+              open(WEB / "data" / "events.json", "w"), separators=(",", ":"))
+    export_feeds(ledger)
+    meta_p = WEB / "data" / "meta.json"
+    meta = json.load(open(meta_p)) if meta_p.exists() else {}
+    meta.update(jobs=len(live), jobs_new_7d=sum(1 for j in live if j["fs"] >= _ago(7) and not j.get("rp")),
+                jobs_generated=TODAY, job_sources=sorted({j["p"] for j in live}))
+    json.dump(meta, open(meta_p, "w"))
+    (WEB / "data" / "jobs.json").unlink(missing_ok=True)  # pre-shard format
+    print(f"exported {len(live)} open postings in {len(shards)} family shards")
+
+
+def export_skills(ledger, cstats):
+    """What the market asks for: skill share among all technical postings, Staff+, and
+    top-pay-tier employers — the last column is the 'what to learn' signal."""
+    groups = {"all": [], "staff": [], "toppay": []}
+    for j in ledger.values():
+        if j.get("cl") or not j.get("d"):
+            continue
+        groups["all"].append(j)
+        if j["lv"] >= 4:
+            groups["staff"].append(j)
+        if (cstats.get(j["ck"]) or {}).get("pay_tier") in ("top", "high"):
+            groups["toppay"].append(j)
+    out = {"generated": TODAY, "n": {g: len(v) for g, v in groups.items()}, "skills": {}}
+    for g, js in groups.items():
+        c = Counter(s for j in js for s in j["sk"])
+        for s, n in c.items():
+            out["skills"].setdefault(s, {})[g] = round(100 * n / max(len(js), 1), 1)
+    json.dump(out, open(WEB / "data" / "skills.json", "w"), separators=(",", ":"))
+
+
+FEED_FAMILIES = ["ai-applied", "cv", "ml-infra", "research", "ml", "embedded", "backend", "frontend", "fullstack",
+                 "infra", "data", "mobile", "security", "eng-mgmt", "product"]
+
+
+def export_feeds(ledger):
+    """Per-family Atom feeds of postings first seen in the last 3 days: a daily digest
+    any visitor can subscribe to, with no accounts and no server."""
+    (WEB / "feeds").mkdir(exist_ok=True)
+    esc = lambda s: html.escape(s or "", quote=True)
+    for fam in FEED_FAMILIES:
+        js = sorted((j for j in ledger.values() if not j.get("cl") and j["f"] == fam and j["fs"] >= _ago(3)
+                     and not j.get("rp") and _fresh(j)), key=lambda j: (-j["lv"], j["fs"]))[:300]
+        entries = "".join(
+            f"<entry><title>{esc(j['t'])} — {esc(j['co'])}</title><link href=\"{esc(j['u'])}\"/>"
+            f"<id>{esc(j['u'])}</id><updated>{j['fs']}T00:00:00Z</updated>"
+            f"<summary>{esc(j['loc'])}{' · pay ' + esc(str(j['pay'][1]) + ' ' + j['pay'][2]) if j.get('pay') else ''}"
+            f"</summary></entry>" for j in js)
+        (WEB / "feeds" / f"{fam}.xml").write_text(
+            f'<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom">'
+            f"<title>unicorn-radar · new {fam} jobs</title><id>unicorn-radar:{fam}</id>"
+            f"<updated>{TODAY}T00:00:00Z</updated>{entries}</feed>")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--only", default="", help="comma list of platforms (debug)")
+    ap.add_argument("--limit", type=int, default=0, help="boards per platform (debug)")
+    ap.add_argument("--no-refresh", action="store_true", help="skip re-downloading board lists")
+    ap.add_argument("--export-only", action="store_true", help="re-derive + re-export the ledger, no scan")
+    args = ap.parse_args()
+    if not args.no_refresh:
+        refresh_lists()
+        harvest_boards()
+    only = set(filter(None, args.only.split(",")))
+    load_extra()
+    boards = [b for b in all_boards(only) if b["p"] in FETCH]
+    if args.limit:
+        per = defaultdict(int)
+        boards = [b for b in boards if (per.__setitem__(b["p"], per[b["p"]] + 1) or per[b["p"]]) <= args.limit]
+    ledger, hist = load_state()
+    reclassify(ledger)
+    if args.export_only:
+        export(ledger, hist, company_stats(ledger))
+        return
+    print(f"scanning {len(boards)} boards across {len({b['p'] for b in boards})} platforms "
+          f"({args.workers} workers each; ledger has {len(ledger)} postings)")
+    results = scan_all(boards, args.workers, ledger)
+    n_fail = sum(1 for _, j in results if j == "fail")
+    if n_fail > len(results) * 0.1:
+        print(f"  ! {100 * n_fail / len(results):.0f}% throttled — scan is DEGRADED; carried forward, "
+              f"but re-run with fewer --workers before trusting today's closures")
+    stats = merge(ledger, results)
+    if not only and not args.limit:
+        write_boards_json(stats)
+    hist = update_history(ledger, hist)
+    cstats = company_stats(ledger)
+    LEDGER.parent.mkdir(exist_ok=True)
+    with gzip.open(LEDGER, "wt") as f:
+        json.dump(ledger, f, separators=(",", ":"))
+    json.dump(hist, open(HISTORY, "w"), separators=(",", ":"))
+    export(ledger, hist, cstats)
+
+
+if __name__ == "__main__":
+    main()
