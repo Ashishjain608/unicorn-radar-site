@@ -1,0 +1,4 @@
+pipeline/cache/*
+!pipeline/cache/mca_subs.json
+!pipeline/cache/extra_boards.csv
+pipeline/__pycache__/
